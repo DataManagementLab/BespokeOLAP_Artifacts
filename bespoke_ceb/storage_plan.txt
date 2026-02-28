@@ -1,0 +1,88 @@
+TABLE: title
+- Layout: Primary structure is columnar SoA with a dense, id-sorted row group for hot join keys (id, kind_id, production_year) stored in a tight 32-bit dictionary/bit-packed segment.
+- Partitioning: Two-tier in-memory partitions: (1) range by production_year (coarse 5-year buckets) for pruning, (2) within each bucket, cluster by kind_id to speed kind filters and joins to kind_type.
+- Encodings: title and series_years use dictionary + front-coding (prefix blocks). imdb_index and phonetic_code use small dictionary with RLE on common NULL/empty values. episode_of_id stored in optional compressed adjacency list for episode joins.
+- Experimental: A “shadow AoS” micro-cache for (id, title) in LRU for GROUP BY title queries; data derived on the fly from columnar store (no redundancy persisted).
+
+TABLE: kind_type
+- Layout: Tiny dimension, fully materialized in AoS array for ultra-fast scans; also a precomputed hash table on kind for IN/ILIKE filtering.
+- Encoding: dictionary ids (1-byte) + inline UTF-8 strings.
+
+TABLE: info_type
+- Layout: AoS array with both id->info and info->id hash maps. Stored as a micro-graph: each info_type id points to a vector of movie_info/movie_info_idx row ids (indirection only, not duplicated values).
+- Encoding: dictionary over info strings; small-string inline storage.
+
+TABLE: movie_info
+- Layout: Columnar, clustered by (info_type_id, movie_id) to accelerate filters on info_type_id and joins on movie_id.
+- Partitioning: logical partitions per info_type_id; within each, movie_id delta-encoded and sorted for merge joins.
+- Encodings: info as dictionary + optional trigram bloom filters for ILIKE/IN; note is dictionary with heavy NULL RLE.
+- Experimental: “value lanes” for hot info_type_id values as contiguous arrays for SIMD filtering.
+
+TABLE: movie_info_idx
+- Layout: Columnar, cluster by (info_type_id, movie_id), numeric-like info stored in a separate numeric lane (float-parsed on load, with bitmap of valid numeric). Raw info string preserved in dictionary for exact recovery.
+- Encodings: numeric lane uses 32-bit float + null bitmap; string lane uses dictionary for non-numeric; note column dictionary + RLE.
+- Experimental: speculative dual-path filter: numeric range predicates hit numeric lane; fallback to regex-valid bitmap + dictionary lookup.
+
+TABLE: cast_info
+- Layout: Columnar with primary clustering by movie_id, secondary by role_id, enabling fast joins from title and role_type.
+- Encodings: person_id, movie_id delta-encoded; role_id small dictionary; person_role_id nullable with bitmap; note dictionary + RLE; nr_order uses bit-pack (variable width).
+- Experimental: “role stripes” where each role_id has a compact slice; logical grouping only (metadata offsets), no duplication.
+
+TABLE: role_type
+- Layout: AoS dimension + hash map on role; inline strings, tiny dictionary.
+
+TABLE: name
+- Layout: Columnar, sorted by id; secondary index on name_pcode_nf and name_pcode_cf as dictionary ids to speed IN/ILIKE.
+- Encodings: name dictionary + front-coding; gender uses 2-bit code with RLE; imdb_index dictionary; md5sum stored in 128-bit packed array.
+- Experimental: phonetic “fanout” table: for each pcode, store contiguous ranges of person_id (indirection only, no data duplication).
+
+TABLE: aka_name
+- Layout: Columnar, clustered by person_id for joins with name/person_info/cast_info; id delta-encoded.
+- Encodings: name dictionary + front-coding; all pcode columns dictionary; md5sum packed 128-bit; imdb_index dictionary + RLE.
+
+TABLE: person_info
+- Layout: Columnar, cluster by (info_type_id, person_id) for selective info_type filters and joins to name/cast_info.
+- Encodings: info dictionary + trigram bloom filter for ILIKE; note dictionary with NULL RLE.
+- Experimental: split “info” into hot/cold tiers: small dictionary for frequent info values; overflow in large dictionary; both referenced by a two-level id.
+
+TABLE: movie_keyword
+- Layout: Columnar, adjacency-list style: for each movie_id, a compressed list of keyword_id (delta + varint). A reverse adjacency for keyword_id -> movie_id stored as offsets (no duplication, just pointers into the same list memory).
+- Encodings: movie_id and keyword_id delta-encoded; row id mapping stored as offsets to allow flat reconstruction.
+
+TABLE: keyword
+- Layout: AoS with id->keyword and keyword->id hash map; keyword dictionary and phonetic_code dictionary.
+
+TABLE: movie_companies
+- Layout: Columnar, cluster by movie_id then company_type_id for filters; adjacency list for movie_id to company_id entries.
+- Encodings: company_id and company_type_id bit-packed; note dictionary + RLE.
+- Experimental: “company palette” per movie_id: store unique company_type_id values as a small palette with local indices for cache-friendly scans.
+
+TABLE: company_name
+- Layout: Columnar, sorted by id; country_code dictionary + RLE (many NULLs). name dictionary + front-coding; name_pcode_nf/sf dictionaries.
+- Experimental: micro-index on country_code to vector of id ranges for fast IN filtering.
+
+TABLE: company_type
+- Layout: AoS dimension; kind dictionary.
+
+TABLE: movie_link
+- Layout: Columnar, clustered by movie_id; linked_movie_id delta-encoded for adjacency traversal; link_type_id small dictionary.
+
+TABLE: aka_title
+- Layout: Columnar, clustered by movie_id for joins to title; title dictionary + front-coding; kind_id bit-packed; production_year delta-encoded.
+- Encodings: note dictionary + RLE; md5sum packed 128-bit; imdb_index dictionary.
+
+TABLE: complete_cast
+- Layout: Columnar, clustered by movie_id; subject_id/status_id bit-packed; id delta-encoded.
+
+TABLE: link_type
+- Layout: AoS dimension; link dictionary.
+
+TABLE: char_name
+- Layout: Columnar, id-sorted; name dictionary + front-coding; pcode dictionaries; md5sum packed.
+
+TABLE: comp_cast_type
+- Layout: AoS dimension; kind dictionary.
+
+TABLE: movie_info / movie_info_idx / person_info (global note on strings)
+- All string columns share a unified, memory-resident string pool with per-column dictionary id maps. The pool is immutable, enabling pointer-stable reconstruction without redundancy.
+- Compression uses segment-level Zstd on dictionary payloads only (not on id arrays), preserving SIMD-friendly scans.

@@ -1,0 +1,13 @@
+[project]
+name = "bespokeolapartifacts"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "bespoke-olap",
+]
+
+[tool.uv.sources]
+bespoke-olap = { git = "https://github.com/DataManagementLab/BespokeOLAP.git" }
+
