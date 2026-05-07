@@ -1,43 +1,56 @@
 # BespokeOLAP Artifacts
 
-Generated C++ artifacts for [Bespoke OLAP](https://github.com/DataManagementLab/BespokeOLAP): synthesized implementations of the **TPC-H** and **CEB** benchmarks.
+> Generated C++ artifacts for [Bespoke OLAP](https://github.com/DataManagementLab/BespokeOLAP) — synthesized, bespoke implementations of the **TPC-H** and **CEB** analytical benchmarks.
 
-## Setup
+---
 
-Requires [uv](https://docs.astral.sh/uv/).
+## 📂 Contents
+
+| Directory | Benchmark | Execution Model |
+|---|---|---|
+| [`bespoke_tpch/`](bespoke_tpch/) | TPC-H Q1–Q22 | 🔁 Single-threaded |
+| [`bespoke_tpch_multithreading/`](bespoke_tpch_multithreading/) | TPC-H Q1–Q22 | ⚡ Multi-threaded *(new)* |
+| [`bespoke_ceb/`](bespoke_ceb/) | CEB Q1a–Q11b | 🔁 Single-threaded |
+
+---
+
+## ⚙️ Requirements
+
+- [uv](https://docs.astral.sh/uv/) (Python package manager)
 
 ```bash
 uv sync
 ```
 
-## Build & Run Generated Databases
-We have provided a sample script to run the generated databases in `run.py`.
+---
+
+## 🚀 Build & Run
+
+The provided `run.py` script compiles and executes the generated C++ code.
+
+> **⚠️ Note:** `run.py` currently supports the **single-threaded** implementations only (`tpch`, `ceb`). A runner for the multi-threaded TPC-H variant will follow.
+
 ```bash
 python run.py [--sf <scale_factor>] [--no-optimize] {tpch,ceb}
 ```
 
-**Arguments:**
+### Options
 
 | Argument | Description | Default |
 |---|---|---|
-| `benchmark` | Benchmark to run: `tpch` or `ceb` | *(required)* |
-| `--sf` | Scale factor | `1` |
-| `--no-optimize` | Disable compiler optimization | *(optimization on)* |
+| `benchmark` | Benchmark to run (`tpch` or `ceb`) | *(required)* |
+| `--sf` | TPC-H scale factor | `1` |
+| `--no-optimize` | Disable compiler optimizations | *(optimizations enabled)* |
 
-**Examples:**
+### Examples
 
 ```bash
-# Run TPC-H at scale factor 20
+# TPC-H at scale factor 20
 python run.py --sf 20 tpch
 
-# Run CEB at scale factor 1
+# CEB at default scale factor
 python run.py ceb
 
-# Run TPC-H without optimization flags (compiler)
+# TPC-H without compiler optimizations
 python run.py --no-optimize --sf 10 tpch
 ```
-
-## Benchmarks
-
-- **bespoke_tpch/** — TPC-H queries Q1–Q22, synthesized as bespoke C++ implementations
-- **bespoke_ceb/** — CEB queries, Q1a-Q11b synthesized as bespoke C++ implementations
