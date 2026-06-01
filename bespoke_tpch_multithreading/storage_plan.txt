@@ -1,0 +1,447 @@
+================================================================================
+  IN-MEMORY ANALYTICAL STORAGE LAYOUT PLAN
+  Workload: TPC-H Queries 1–22
+================================================================================
+
+DESIGN PHILOSOPHY
+-----------------
+All tables use a columnar (Structure-of-Arrays / SoA) primary layout, because
+the workload is uniformly projection-heavy and aggregation-centric with highly
+selective filters.  Each "column" is a typed, independently addressable memory
+region.  The plans below layer additional tricks on top:
+
+  • Bit-packing / frame-of-reference (FOR) encoding for integers and decimals
+  • FSST (Fast Static Symbol Table) compression for short/medium strings
+  • Roaring Bitmaps for low-cardinality flag/status/segment columns
+  • Zone maps (min/max metadata per 64K-row block) for range-filter columns
+  • Adaptive run-length encoding (ARLE) where sort order enables long runs
+  • Late-materialisation: heavy free-text comment columns stored separately
+    in a side-store and fetched only when projected (never scanned for filters)
+  • Implicit foreign-key integer columns stored as delta-coded arrays so that
+    join probes can use SIMD gather without pointer chasing
+
+================================================================================
+TABLE: lineitem   (~6 M rows at SF-1, largest table, hottest in the workload)
+================================================================================
+
+Access summary across queries:
+  Filters  : l_shipdate (Q1,6,7,12,14,15,19,20), l_returnflag (Q1,10),
+              l_discount (Q6), l_quantity (Q6,17,19), l_shipmode (Q12,19),
+              l_shipinstruct (Q19), l_commitdate < l_receiptdate (Q4,12,21),
+              l_suppkey (Q15,20,21), l_partkey (Q14,17,19,20)
+  Aggregates: l_extendedprice, l_discount, l_quantity, l_tax (Q1,3,5–10,12,14–19)
+  Joins     : l_orderkey (all multi-table queries), l_suppkey, l_partkey
+  GROUP BY  : l_returnflag, l_linestatus, l_shipmode, l_suppkey
+
+PRIMARY SORT ORDER:  l_shipdate  ASC  (maximises zone-map pruning for the
+                     ubiquitous date range filters in Q1,6,7,12,14,15,20)
+SECONDARY SORT:      l_orderkey  ASC  (clusters lineitem rows per order, speeds
+                     correlated sub-queries Q4,18,21)
+
+--- Column storage layout (SoA, 64K-row blocks) ---
+
+BLOCK 1 – "Hot Numeric Spine"  (scanned together in almost every query)
+  These four columns are interleaved as a struct array of 4×int32 per row
+  (AoS micro-layout) so that a single cache-line fetch retrieves all four
+  values for one lineitem, enabling branch-free expression evaluation:
+
+  l_extendedprice  : fixed-point int32  (original value × 100, fits int32 for
+                     realistic prices); stored as FOR delta from block minimum;
+                     block min/max metadata kept in block header.
+  l_discount       : uint8  (0–100 representing 0.00–1.00 in hundredths; only
+                     11 distinct values in TPC-H; stored as a 4-bit nibble
+                     packed two-per-byte, with a 16-entry lookup table mapping
+                     nibble → true uint8 discount value)
+  l_quantity       : uint8  (1–50 in TPC-H; fits 6 bits; packed as uint8)
+  l_tax            : uint8  (0–8 in hundredths; 3-bit value, packed as uint8)
+
+  ↳ AoS struct size: 4 + 1 + 1 + 1 = 7 bytes, padded to 8 bytes per row.
+    For 64K rows one block = 512 KB, fits in L2/L3.
+
+BLOCK 2 – "Date Trio"  (Q4,12,21 test all three dates; Q1,6,7 test shipdate)
+  Stored as three parallel uint16 columns using a day-offset encoding:
+  Epoch = 1992-01-01  (all TPC-H dates fall in 1992–1998, range 2557 days,
+  comfortably within uint16).
+
+  l_shipdate    : uint16, sorted (primary key of partition sort order);
+                  zone maps on each 64K block → fast range-skip.
+                  Run-length encoding applied within block where consecutive
+                  rows share the same shipdate (common after sort).
+  l_commitdate  : uint16, delta-coded vs l_shipdate (always ≤ shipdate or
+                  close; delta fits int8 for most rows → further compresses to
+                  int8 column with occasional int16 overflow array).
+  l_receiptdate : uint16, delta-coded vs l_commitdate (receipt > commit;
+                  delta typically 1–30 → int8 suffices).
+
+  ↳ Comparison l_commitdate < l_receiptdate becomes a SIMD subtraction of two
+    int8 delta columns → sign-bit test, no decoding needed.
+
+BLOCK 3 – "Low-Cardinality Flags"
+  l_returnflag  : 2-bit enum  {N=0, A=1, R=2}  packed 4-per-byte.
+                  Roaring Bitmap index per value for fast equality filter (Q1,Q10).
+  l_linestatus  : 1-bit  {O=0, F=1}  packed 8-per-byte.
+                  Roaring Bitmap index.
+  l_shipmode    : 3-bit enum  {TRUCK=0, MAIL=1, REG AIR=2, AIR=3, SHIP=4,
+                               FOB=5, RAIL=6}  packed 2-per-byte.
+                  Roaring Bitmap index per shipmode for IN-list filters (Q12,19).
+  l_shipinstruct: 2-bit enum  {DELIVER IN PERSON=0, COLLECT COD=1,
+                               TAKE BACK RETURN=2, NONE=3} packed 4-per-byte.
+                  Roaring Bitmap index (Q19 filters on one value).
+
+  ↳ All four columns stored in one 64K-row "flag block" = 64K × 1 byte = 64 KB.
+    Entire flag block fits in L1/L2 cache during a scan.
+
+BLOCK 4 – "Foreign Key Spine"  (join columns)
+  l_orderkey  : int32, delta-coded within block (consecutive rows often share
+                the same order → long runs of delta=0, ARLE compresses well).
+                Separate sorted position list (orderkey → [first_row, last_row])
+                enables fast probe from orders side.
+  l_partkey   : int32, bit-packed to 21 bits (max ~200K parts at SF-1);
+                stored as sorted partkey within same orderkey group → short
+                delta sequences.
+  l_suppkey   : int32, bit-packed to 17 bits (max ~10K suppliers at SF-1).
+  l_linenumber: uint4 (1–7), packed 2-per-byte.  Used only for PK reconstruction.
+
+BLOCK 5 – "Comment Side-Store"  (never filtered, only projected)
+  l_comment   : FSST-compressed variable-length strings stored in a separate
+                contiguous byte buffer; offset array (int32) indexes into buffer.
+                Lazy-loaded: the offset array is in hot memory; the string bytes
+                may be in a cooler memory tier or simply paged in on demand.
+
+SUPPLEMENTARY STRUCTURES ON lineitem:
+  • Bloom filter on l_partkey  (64K bits, <8 KB) for fast semi-join from part.
+  • Bloom filter on l_suppkey  (8K bits, <1 KB) for fast semi-join from supplier.
+  • Per-block zone maps (min, max, null-count) on l_shipdate, l_partkey,
+    l_suppkey, l_orderkey stored in a compact 256-byte block header.
+  • Lightweight CSR (Compressed Sparse Row) secondary index:
+      orderkey  → contiguous row range  (since sorted by orderkey secondarily)
+      suppkey   → sorted list of row IDs (small, fits in L3)
+      partkey   → sorted list of row IDs
+    These enable merge-join and index-nested-loop join without full scans.
+
+================================================================================
+TABLE: orders   (~1.5 M rows at SF-1)
+================================================================================
+
+Access summary:
+  Filters  : o_orderdate range (Q3,4,5,7,8,10,12,18), o_orderstatus='F' (Q21),
+              o_custkey (join to customer), o_comment NOT LIKE (Q13)
+  Projects : o_orderkey, o_orderdate, o_shippriority, o_orderpriority,
+              o_totalprice, o_custkey
+  Joins    : o_orderkey (to lineitem), o_custkey (to customer)
+
+PRIMARY SORT ORDER:  o_orderdate ASC  (serves range filters in Q3,4,5,7,8,10,12,18)
+SECONDARY SORT:      o_custkey  ASC   (speeds join to customer in Q3,5,7,8,10,13,22)
+
+--- Column storage layout ---
+
+  o_orderkey      : int32, sorted list (implicit dense PK after sort); stored as
+                    delta-coded int32 (monotone after sort by date+custkey so
+                    deltas are small); separate hash map orderkey→row_id for
+                    O(1) probe from lineitem side.
+  o_orderdate     : uint16 (day offset from 1992-01-01, range fits easily);
+                    ARLE within 64K-row blocks (many consecutive rows share date);
+                    zone maps per block.
+  o_custkey       : int32, delta-coded within block (sorted secondary order
+                    → monotone within date bucket → small deltas).
+  o_orderstatus   : 2-bit enum {O=0, F=1, P=2} packed 4-per-byte;
+                    Roaring Bitmap per value (Q21 filters o_orderstatus='F').
+  o_orderpriority : 3-bit enum {1-URGENT=0, 2-HIGH=1, 3-MEDIUM=2,
+                                4-NOT SPEC=3, 5-LOW=4} packed 2-per-byte;
+                    Roaring Bitmap per value (Q4,12 GROUP BY / filter).
+  o_shippriority  : uint8 (always 0 in TPC-H; store as single scalar + bitmap
+                    of "non-zero" rows — effectively free).
+  o_totalprice    : int32 (fixed-point ×100); FOR-delta per 64K block;
+                    zone maps for potential range predicates.
+  o_clerk         : Dictionary-encoded: ~1000 distinct clerks → uint16 code;
+                    dictionary stored as sorted array of 15-char strings;
+                    code column stored as uint16 array.
+  o_comment       : FSST-compressed side-store (same pattern as l_comment);
+                    only read in Q13 (NOT LIKE scan) and never for other queries.
+                    For Q13 specifically, a lightweight "contains" Bloom filter
+                    on 2-gram pairs of "[WORD1]" and "[WORD2]" can pre-filter
+                    blocks before FSST decompression.
+
+SUPPLEMENTARY STRUCTURES ON orders:
+  • CSR index: custkey → sorted array of row_ids (enables index NL join for Q22).
+  • Sorted array of (o_orderdate, row_id) pairs for binary-search range access.
+  • Bloom filter on o_custkey  (~150K bits) for anti-join Q22.
+  • Zone maps per 64K-row block on o_orderdate, o_totalprice, o_custkey.
+
+================================================================================
+TABLE: customer   (~150 K rows at SF-1)
+================================================================================
+
+Access summary:
+  Filters  : c_mktsegment (Q3), c_nationkey (Q5,7,8,10), c_phone prefix (Q22),
+              c_acctbal (Q22), anti-join on o_custkey (Q22)
+  Projects : c_custkey, c_name, c_address, c_phone, c_acctbal,
+              c_nationkey, c_comment
+  Joins    : c_custkey (to orders)
+
+PRIMARY SORT ORDER:  c_custkey ASC  (natural PK order; join target from orders)
+
+--- Column storage layout ---
+
+  c_custkey    : implicit dense integer 1..N; no storage needed (row index = key).
+  c_nationkey  : uint8 (0–24); Roaring Bitmap per nation for equality filter.
+  c_mktsegment : 3-bit enum {BUILDING=0, AUTOMOBILE=1, MACHINERY=2,
+                             HOUSEHOLD=3, FURNITURE=4} packed 2-per-byte;
+                 Roaring Bitmap per segment (Q3 filters on one segment).
+  c_acctbal    : int32 fixed-point ×100; FOR-delta per block; zone maps.
+  c_phone      : Only the first 2 characters (country code) are ever queried
+                 (Q22). Store:
+                   • c_phone_cc : uint8 (2-digit country code as integer 10–99);
+                     Roaring Bitmap per code value.
+                   • c_phone_rest: remaining 13 chars stored as packed 13-byte
+                     fixed array for full reconstruction; FSST compressed.
+  c_name       : FSST-compressed; only projected, never filtered.
+  c_address    : FSST-compressed side-store; only projected (Q10).
+  c_comment    : FSST-compressed side-store; only projected (Q10).
+
+SUPPLEMENTARY STRUCTURES ON customer:
+  • Sorted array of (c_acctbal, c_custkey) for Q22 avg sub-query (can be
+    answered with a single pass over this auxiliary structure).
+  • Bloom filter on c_custkey for anti-join (Q22 "not exists orders").
+
+================================================================================
+TABLE: part   (~200 K rows at SF-1)
+================================================================================
+
+Access summary:
+  Filters  : p_size (Q2,16), p_type LIKE / = (Q2,8,16), p_brand (Q16,17,19),
+              p_container (Q17,19), p_name LIKE (Q9), p_type LIKE 'PROMO%' (Q14)
+  Projects : p_partkey, p_mfgr, p_brand, p_type, p_size, p_container,
+             p_retailprice, p_comment
+  Joins    : p_partkey (to lineitem, partsupp)
+
+PRIMARY SORT ORDER:  p_partkey ASC  (dense PK; join target)
+SECONDARY GROUPING:  p_brand, p_type, p_size  (serves Q2,16,17,19 GROUP BY /
+                     filter clusters)
+
+--- Column storage layout ---
+
+  p_partkey    : implicit dense integer; row index = partkey.
+  p_size       : uint8 (1–50); stored as plain uint8 array; Roaring Bitmap per
+                 size value (Q2 equality, Q16 IN-list, Q19 range all served
+                 by bitmap union/intersection).
+  p_brand      : Dictionary-encoded: 25 distinct brands (Brand#XY) → uint8 code;
+                 Roaring Bitmap per brand.
+  p_type       : Two-level encoding:
+                   • p_type_prefix: 3-bit enum for the first word
+                     {STANDARD, SMALL, MEDIUM, LARGE, ECONOMY, PROMO} → uint8;
+                     Roaring Bitmap per prefix (Q14 'PROMO%', Q16 NOT LIKE).
+                   • p_type_suffix: remaining suffix stored as dictionary (uint8
+                     code → string); ~50 distinct full types → fits uint8.
+                   • Full type reconstructed as prefix_string + ' ' + suffix.
+  p_container  : 3-bit enum (8 container types in TPC-H); stored as uint8;
+                 Roaring Bitmap per value (Q17,19 IN-list).
+  p_mfgr       : Dictionary: 5 distinct manufacturers → 3-bit code, uint8 stored.
+  p_retailprice: int32 fixed-point ×100; FOR-delta per block.
+  p_name       : FSST-compressed; used only for LIKE '%COLOR%' scan (Q9);
+                 accompanied by a 2-gram Bloom filter per row group to
+                 skip blocks that cannot contain the color substring.
+  p_comment    : FSST-compressed side-store.
+
+SUPPLEMENTARY STRUCTURES ON part:
+  • Inverted index on p_name 2-grams → sorted list of p_partkeys; supports
+    LIKE '%COLOR%' in Q9 without scanning full name column.
+  • Bloom filter on p_partkey (exported for use by lineitem/partsupp join).
+
+================================================================================
+TABLE: supplier   (~10 K rows at SF-1)
+================================================================================
+
+Access summary:
+  Filters  : s_nationkey (Q2,5,7,8,9,11,20,21), s_suppkey (Q2,11,15,16,21),
+              s_comment LIKE '%Customer%Complaints%' (Q16)
+  Projects : s_suppkey, s_name, s_address, s_phone, s_acctbal, s_comment
+  Joins    : s_suppkey (to lineitem, partsupp), s_nationkey (to nation)
+
+PRIMARY SORT ORDER:  s_suppkey ASC  (dense PK)
+
+--- Column storage layout ---
+
+  Small table (~10 K rows) → fits entirely in L2/L3 cache.
+  Use a hybrid AoS layout (struct-per-supplier) for the hot columns so that
+  a single supplier record can be fetched in ≤2 cache lines:
+
+  HOT AoS struct (per supplier, 32 bytes):
+    s_suppkey   : int32  (4 B) — implicit but stored for self-describing layout
+    s_nationkey : uint8  (1 B) — 0–24
+    s_acctbal   : int32  (4 B) — fixed-point ×100
+    s_phone_cc  : uint8  (1 B) — 2-digit country code
+    _padding    : 2 B
+    s_name_code : uint16 (2 B) — dictionary code for s_name (unique per supplier,
+                  dictionary = sorted array of 25-char strings)
+    s_address_ptr: uint32 (4 B) — offset into FSST-compressed address buffer
+    _reserved   : 14 B  (for future fields / alignment to 32 B)
+
+  COLD SoA side-store:
+    s_phone_rest: 13-byte fixed array per supplier, FSST-compressed.
+    s_name_dict : array of 10K × 25 chars (FSST-compressed ~60% ratio → ~150 KB).
+    s_address   : FSST variable-length buffer + uint32 offset array.
+    s_comment   : FSST variable-length buffer + uint32 offset array.
+                  SPECIAL: a secondary bitmap "complaints_bm" (Roaring) marks
+                  suppliers whose s_comment matches '%Customer%Complaints%'
+                  (Q16 anti-join uses this bitmap directly, zero FSST decode).
+
+SUPPLEMENTARY STRUCTURES ON supplier:
+  • Roaring Bitmap per n_nationkey value → set of s_suppkeys (10 bitmaps,
+    each ≤10 K bits; used for Q2,5,7,8,9,11,20,21 nation filters).
+  • complaints_bm: pre-computed Roaring Bitmap of s_suppkeys with complaints
+    (Q16 subquery answered in O(1) as a bitmap difference).
+
+================================================================================
+TABLE: partsupp   (~800 K rows at SF-1)
+================================================================================
+
+Access summary:
+  Filters  : ps_partkey (join from part), ps_suppkey (join from supplier),
+              ps_availqty (Q20), ps_supplycost MIN subquery (Q2,9,11)
+  Projects : ps_partkey, ps_suppkey, ps_supplycost, ps_availqty
+  Joins    : ps_partkey (to part), ps_suppkey (to supplier)
+  Aggregates: SUM(ps_supplycost × ps_availqty) (Q9,11),
+              MIN(ps_supplycost) per partkey (Q2)
+
+PRIMARY SORT ORDER:  ps_partkey ASC, ps_suppkey ASC
+  (groups all suppliers for a part together → serves Q2 MIN subquery,
+   Q11/Q9 aggregations efficiently)
+
+--- Column storage layout ---
+
+  ps_partkey    : int32, delta-coded (monotone after sort → small positive
+                  deltas; run-length for repeated partkey within group).
+                  CSR offsets: partkey → [start_row, end_row] for O(1)
+                  lookup of all suppliers for a part.
+  ps_suppkey    : int32, delta-coded within partkey group (4 suppkeys per part
+                  in TPC-H → trivially small groups; stored as uint16 relative
+                  to group start for compactness).
+  ps_supplycost : int32 fixed-point ×100; FOR-delta per block; zone maps.
+                  Secondary sorted min-index per partkey (array of per-partkey
+                  minimum supplycost) stored as separate int32 array indexed
+                  by partkey → O(1) MIN lookup for Q2 correlated subquery.
+  ps_availqty   : int32; FOR-delta per block; zone maps.
+  ps_comment    : FSST-compressed side-store; never filtered.
+
+SUPPLEMENTARY STRUCTURES ON partsupp:
+  • Per-partkey aggregate cache: array[p_partkey] of (min_supplycost,
+    sum_supplycost_times_availqty) — a 200K × 12-byte materialized summary
+    (2.4 MB) that answers Q2 MIN and Q11 SUM subqueries in O(1) per partkey
+    without scanning partsupp at all. Invalidated on updates.
+  • Bloom filter on ps_suppkey for semi-join from supplier side.
+
+================================================================================
+TABLE: nation   (~25 rows)
+================================================================================
+
+Access summary:
+  Joins    : n_nationkey (to supplier, customer, partsupp),
+             n_regionkey (to region)
+  Projects : n_name (Q2,5,7,8,9,10,11,20,21)
+  Filters  : n_name equality (Q11,20,21), n_regionkey (Q2,5,7,8)
+
+Tiny table (25 rows) — fits in a single cache line cluster.
+
+--- Column storage layout ---
+
+  FULL AoS LAYOUT (25 rows × ~32 bytes = 800 bytes, fits in one cache line set):
+
+  Struct per nation (tightly packed):
+    n_nationkey : uint8   (1 B)
+    n_regionkey : uint8   (1 B)
+    n_name      : 26 B    (fixed 25-char + null; no compression needed at 25 rows)
+    n_comment   : uint16  (2 B) offset into a 25-entry FSST comment buffer
+    _pad        : 2 B
+
+  Total: 25 × 32 B = 800 B.  Entire table pinned in L1 cache.
+
+  Supplementary lookup arrays (also pinned in L1/L2):
+    name_to_key : sorted array of (n_name[25], n_nationkey) → binary search in
+                  ≤5 comparisons; alternatively a perfect hash (25 keys).
+    key_to_regionkey: uint8[25] array indexed by nationkey → O(1).
+    region_to_nations: uint8[5][5] array (regionkey → list of nationkeys)
+                       for Q2,5,7,8 region-filter → nation set expansion.
+
+================================================================================
+TABLE: region   (~5 rows)
+================================================================================
+
+Access summary:
+  Filters  : r_name equality (Q2,5,7,8)
+  Joins    : r_regionkey (to nation)
+  Projects : r_name
+
+Trivially tiny (5 rows, 5×(4+25+152) ≈ 900 bytes).
+
+--- Column storage layout ---
+
+  SINGLE STATIC STRUCT ARRAY (5 entries, fully unrolled):
+
+  Struct per region:
+    r_regionkey : uint8   (1 B)
+    r_name      : 26 B    (fixed 25-char + null)
+    _pad        : 5 B
+    r_comment   : FSST inline (≤152 chars; 5 comments → negligible)
+
+  Total: ~160 B.  Entire table fits in one or two cache lines.
+
+  Supplementary:
+    name_to_key: perfect hash or switch-case over 5 values → O(1) filter.
+    Precomputed region membership bitmask for nation table:
+      region_nation_mask[5]: each entry is a uint32 bitmask with bits set for
+      the nationkeys belonging to that region (25 nations → fits uint32).
+      Used by Q2,5,7,8 to immediately obtain the set of valid nation IDs
+      without any join, then apply as a bitmask filter on customer/supplier.
+
+================================================================================
+CROSS-TABLE STRUCTURES & GLOBAL OPTIMISATIONS
+================================================================================
+
+1. ORDERKEY ↔ LINEITEM CLUSTER INDEX
+   A compact CSR structure:
+     orders_to_lineitem_start[o_orderkey] : int32 array (1.5M entries, 6 MB)
+     orders_to_lineitem_end[o_orderkey]   : int32 array (1.5M entries, 6 MB)
+   Both tables sorted by o_orderkey / l_orderkey → lineitem rows for an order
+   are contiguous. This serves Q3,4,5,7,8,9,10,12,18,21 at near-zero overhead.
+2. PARTKEY ↔ LINEITEM POSITION LIST
+   sorted_lineitem_by_partkey: array of (l_partkey, row_id) sorted by partkey.
+   Used for Q9,14,17,19,20 partkey-based lookups into lineitem.
+   Stored as parallel uint32 arrays (partkey-sorted row_ids) + CSR offsets.
+3. SUPPKEY ↔ LINEITEM POSITION LIST
+   sorted_lineitem_by_suppkey: array of (l_suppkey, row_id) sorted by suppkey.
+   Used for Q11,15,20,21.
+4. ADAPTIVE BLOCK SIZING
+   Default block size is 64K rows.  For lineitem (6M rows, 92 blocks) this
+   gives ~92 zone-map entries per column — small enough to evaluate all zone
+   maps in a single SIMD pass before touching any data block.
+5. DICTIONARY INTERNING ACROSS TABLES
+   n_name strings are shared by nation, and referenced by code from supplier
+   and customer columns (s_nationkey / c_nationkey), so query output projection
+   of n_name never requires a string copy — it is a pointer into the single
+   nation name array.
+6. SPECULATIVE "REVENUE COLUMN" MATERIALISATION
+   For lineitem, materialise a derived column:
+     l_rev = l_extendedprice × (1 − l_discount)   (int32 fixed-point ×10000)
+   stored alongside the hot numeric spine.  This is NOT redundant storage of
+   source columns (those are still kept for Q1 separate avg computations and
+   Q6's discount-only filter), but is an additional pre-computed column that
+   directly serves SUM(revenue) in Q3,5,6,7,8,9,10,12,14,15,17,18,19 without
+   per-row multiplication.  ~24 MB overhead at SF-1; saves FP multiply in the
+   hottest path.
+7. COMPRESSED DATE RANGE LOOKUP TABLE
+   A precomputed table: shipdate_day → (block_id_first, block_id_last) for
+   lineitem's date-sorted layout.  Any l_shipdate range predicate degrades to
+   two lookups + sequential block scan with no per-row date comparison needed
+   outside the first and last partial blocks.
+================================================================================
+ENCODING LEGEND
+================================================================================
+  FOR     : Frame-of-Reference encoding (store block_min + delta per value)
+  ARLE    : Adaptive Run-Length Encoding (run header + count if run > threshold)
+  FSST    : Fast Static Symbol Table compression (vectorised string compression)
+  Roaring : Roaring Bitmap compressed integer sets
+  CSR     : Compressed Sparse Row (offset array + value array)
+  AoS     : Array of Structures (row-major micro-layout within a column group)
+  SoA     : Structure of Arrays (column-major macro-layout, default)
+================================================================================
